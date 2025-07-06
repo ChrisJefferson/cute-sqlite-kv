@@ -188,6 +188,32 @@ impl KVStore {
         Ok(())
     }
 
+    /// Checks if a particular key is contained in the `KVStore`.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key to check for existence.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use cute_sqlite_kv::KVStore;
+    ///
+    /// let kvstore = KVStore::new_in_memory().unwrap();
+    ///
+    /// kvstore.insert("key", "value").unwrap();
+    ///
+    /// assert!(kvstore.contains_key("key").unwrap());
+    /// assert!(!kvstore.contains_key("nonexistent_key").unwrap());
+    /// ```
+    pub fn contains_key(&self, key: &str) -> rusqlite::Result<bool> {
+        let mut stmt = self.connection.prepare(&format!(
+            "SELECT EXISTS(SELECT 1 FROM {TABLE} WHERE {KEY_COLUMN} = ?)"
+        ))?;
+        let exists: i32 = stmt.query_row([key], |row| row.get(0))?;
+        Ok(exists != 0)
+    }
+
     /// Retrieves the value for a given key from the `KVStore`.
     ///
     /// # Arguments
@@ -274,6 +300,55 @@ impl KVStore {
         self.connection
             .execute(&format!("DELETE FROM {TABLE}"), ())?;
         Ok(())
+    }
+
+    /// Checks if the `KVStore` is empty.
+    ///
+    /// Note: Since the `KVStore` can be used concurrently, the result of this method
+    /// can be out of date almost immediately.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use cute_sqlite_kv::KVStore;
+    ///
+    /// let kvstore = KVStore::new_in_memory().unwrap();
+    /// assert!(kvstore.is_empty().unwrap());
+    ///
+    /// kvstore.insert("key", "value").unwrap();
+    /// assert!(!kvstore.is_empty().unwrap());
+    /// ```
+    pub fn is_empty(&self) -> rusqlite::Result<bool> {
+        let mut stmt = self
+            .connection
+            .prepare(&format!("SELECT NOT EXISTS(SELECT 1 FROM {TABLE})"))?;
+        let is_empty: i32 = stmt.query_row([], |row| row.get(0))?;
+        Ok(is_empty != 0)
+    }
+
+    /// Returns the number of key-value pairs in the `KVStore`.
+    ///
+    /// Note: Since the `KVStore` can be used concurrently, the result of this method
+    /// can be out of date almost immediately.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use cute_sqlite_kv::KVStore;
+    ///
+    /// let kvstore = KVStore::new_in_memory().unwrap();
+    /// assert_eq!(kvstore.len().unwrap(), 0);
+    ///
+    /// kvstore.insert("key1", "value1").unwrap();
+    /// kvstore.insert("key2", "value2").unwrap();
+    /// assert_eq!(kvstore.len().unwrap(), 2);
+    /// ```
+    pub fn len(&self) -> rusqlite::Result<usize> {
+        let mut stmt = self
+            .connection
+            .prepare(&format!("SELECT COUNT(*) FROM {TABLE}"))?;
+        let count: i64 = stmt.query_row([], |row| row.get(0))?;
+        Ok(count as usize)
     }
 }
 
