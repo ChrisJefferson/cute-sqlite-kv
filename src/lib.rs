@@ -246,7 +246,7 @@ impl KVStore {
     }
 
     /// Removes a key-value pair from the `KVStore`,
-    /// if present
+    /// if present, and returns the old value if it existed.
     ///
     /// # Arguments
     ///
@@ -261,17 +261,24 @@ impl KVStore {
     ///
     /// kvstore.insert("key", "value").unwrap();
     ///
-    /// kvstore.remove("key").unwrap();
+    /// let old_value = kvstore.remove("key").unwrap();
+    /// assert_eq!(old_value, Some("value".to_string()));
     ///
     /// let result = kvstore.get("key").unwrap();
     /// assert_eq!(result, None);
+    ///
+    /// let old_value = kvstore.remove("key").unwrap();
+    /// assert_eq!(old_value, None);
     /// ```
-    pub fn remove(&self, key: &str) -> rusqlite::Result<()> {
-        self.connection.execute(
-            &format!("DELETE FROM {TABLE} WHERE {KEY_COLUMN} = ?"),
-            [key],
-        )?;
-        Ok(())
+    pub fn remove(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        let old_value = self.get(key)?; // Retrieve the old value if it exists
+        if old_value.is_some() {
+            self.connection.execute(
+                &format!("DELETE FROM {TABLE} WHERE {KEY_COLUMN} = ?"),
+                [key],
+            )?;
+        }
+        Ok(old_value)
     }
 
     /// Clears the entire table in the `KVStore`.
