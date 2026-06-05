@@ -4,6 +4,8 @@
 
 `cute-sqlite-kv` is a simple, opinionated Rust wrapper for SQLite that provides a persistent, multi-process key-value store. It is designed to be as small and simple as possible while still being correct, rather than for high performance.
 
+Two stores are provided: `KVStore` for string values and `BlobStore` for binary (`Vec<u8>`) values. Both are aliases for a generic `Store<V>` that holds all the logic — only the value type differs. Keys are always `&str`.
+
 
 ## Installation
 
@@ -35,6 +37,25 @@ assert_eq!(kvstore.remove("username"), Some("alice".to_string()));
 assert_eq!(kvstore.get("username"), None);
 ```
 
+### Binary values
+
+Use `BlobStore` when values are arbitrary bytes rather than strings — for example a large string you have compressed with zstd before storing:
+
+```rust
+use cute_sqlite_kv::BlobStore;
+
+let store = BlobStore::new_from_file("blobs.db").unwrap();
+
+let bytes: &[u8] = &[0, 1, 2, 255];
+store.insert("key", bytes);
+
+assert_eq!(store.get("key"), Some(bytes.to_vec()));
+```
+
+A given database file should be used with a **single** store type. The value column holds whatever you write, but reading a binary value back as a `String` (or a text value as bytes) fails — and, per the panic policy below, that is a panic. So pick `KVStore` or `BlobStore` for a file and stick to it.
+
+`cute-sqlite-kv` does not compress for you: that keeps the database inspectable in any SQLite tool and leaves the choice of codec to you. Compress before `insert` and decompress after `get`.
+
 ## Errors and panics
 
 Opening a store (`new_from_file` / `new_in_memory`) returns a `Result`, because a bad path or permissions is something a caller may reasonably want to handle.
@@ -44,6 +65,8 @@ Every *other* operation panics if the underlying SQLite call fails. Once the sto
 The same file can be opened from multiple processes, and multiple times from the same process. `KVStore` is `Send` but not `Sync` (SQLite connections are not `Sync`), so to use it from several threads, open one `KVStore` per thread rather than sharing one behind an `Arc`.
 
 ## API Reference
+
+The table below shows the methods for `KVStore` (string values). For `BlobStore`, the value type changes: `insert` takes `&[u8]`, and `get`/`remove` return `Option<Vec<u8>>`.
 
 | Method | Description | Returns |
 |--------|-------------|---------|

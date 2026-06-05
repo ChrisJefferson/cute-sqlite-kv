@@ -4,13 +4,29 @@
 //! The code is intended to be as simple a wrapper around `SQLite`
 //! (via rusqlite) as possible.
 //!
-//! The key-value store created can be used from multiple processes,
-//! and also opened multiple times from the same process.
+//! Two stores are provided:
+//!
+//! - [`KVStore`] maps string keys to string values.
+//! - [`BlobStore`] maps string keys to binary (`Vec<u8>`) values.
+//!
+//! Both are thin aliases for the generic [`Store`], which holds all the
+//! logic; only the value type differs. Keys are always `&str`.
+//!
+//! The store can be used from multiple processes, and also opened
+//! multiple times from the same process.
 //!
 //! While `SQLite` can be very quick, this key-value store is not
 //! intended for high-performance situations, but when you need
 //! something as simple as possible, but still correct. Please feel
 //! free to take, extend, and modify this code for your own requirements!
+//!
+//! # One value type per database file
+//!
+//! A given database file should be used with a single store type. The
+//! value column happily holds whatever you write (text or binary), but
+//! reading a binary value back as a `String` (or a text value as bytes)
+//! fails -- and, per the panic policy below, that failure is a panic.
+//! So pick [`KVStore`] or [`BlobStore`] for a file and stick to it.
 //!
 //! # Errors and panics
 //!
@@ -28,62 +44,6 @@
 //!
 //! # Examples
 //!
-//! ```no_run
-//! use cute_sqlite_kv::KVStore;
-//!
-//! // Create a new key-value store backed by a file
-//! let kvstore = KVStore::new_from_file("mydata.db").unwrap();
-//!
-//! // Insert a key-value pair
-//! kvstore.insert("key", "value");
-//!
-//! // Get the value for a key
-//! assert_eq!(kvstore.get("key"), Some("value".to_string()));
-//!
-//! // Remove a key
-//! kvstore.remove("key");
-//!
-//! // Check if the key is removed
-//! assert_eq!(kvstore.get("key"), None);
-//! ```
-//!
-//! # Usage
-//!
-//! To use the `KVStore` struct, you need to import the `cute_sqlite_kv` crate and create a new `KVStore` instance.
-//! You can create a `KVStore` either in-memory or from a file.
-//!
-//! ## In-Memory `KVStore`
-//!
-//! To create a new in-memory `KVStore`, use the `new_in_memory` method:
-//!
-//! ```rust
-//! use cute_sqlite_kv::KVStore;
-//!
-//! let kvstore = KVStore::new_in_memory().unwrap();
-//! ```
-//!
-//! ## File-based `KVStore`
-//!
-//! To create a new `KVStore` using a file as the storage, use the `new_from_file` method and provide the path to the file:
-//!
-//! ```no_run
-//! use cute_sqlite_kv::KVStore;
-//!
-//! let kvstore = KVStore::new_from_file("mydata.db").unwrap();
-//! ```
-//!
-//! # Methods
-//!
-//! The `KVStore` struct provides the following methods:
-//!
-//! - `insert`: Inserts a key-value pair in the `KVStore`.
-//! - `get`: Retrieves the value for a given key from the `KVStore`.
-//! - `remove`: removes a key-value pair from the `KVStore`.
-//!
-//! Please refer to the method documentation for more details on how to use each method.
-//!
-//! # Examples
-//!
 //! ```rust
 //! use cute_sqlite_kv::KVStore;
 //!
@@ -98,10 +58,32 @@
 //! assert_eq!(kvstore.get("key"), None);
 //! ```
 //!
+//! Storing binary values with [`BlobStore`]:
+//!
+//! ```rust
+//! use cute_sqlite_kv::BlobStore;
+//!
+//! let store = BlobStore::new_in_memory().unwrap();
+//!
+//! let bytes: &[u8] = &[0, 1, 2, 255];
+//! store.insert("key", bytes);
+//!
+//! assert_eq!(store.get("key"), Some(bytes.to_vec()));
+//! ```
+//!
+//! Creating a file-backed store:
+//!
+//! ```no_run
+//! use cute_sqlite_kv::KVStore;
+//!
+//! let kvstore = KVStore::new_from_file("mydata.db").unwrap();
+//! ```
+use std::marker::PhantomData;
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::types::FromSql;
+use rusqlite::{Connection, OptionalExtension, ToSql};
 
 const KEY_COLUMN: &str = "KVStore_key";
 const VAL_COLUMN: &str = "KVStore_val";
@@ -111,22 +93,53 @@ const TABLE: &str = "KVStore_table";
 /// connection or process before giving up (and panicking).
 ///
 /// Every operation here is a single autocommit statement, so two
-/// `KVStore` writers simply serialise: the loser's busy-handler sleeps
-/// and retries until the winner commits (typically microseconds). This
-/// timeout therefore only matters when some *other* process holds the
-/// write lock for a long time -- a long external transaction, or a
-/// hung/crashed process leaving a stale lock. A genuine deadlock is not
-/// affected by this value: `SQLite` returns `SQLITE_BUSY` immediately in
-/// that case rather than waiting. We pick a generous timeout so a slow
-/// but live lock-holder is tolerated, and only give up (panic) once a
-/// wait this long suggests the holder is never going to release.
+/// writers simply serialise: the loser's busy-handler sleeps and retries
+/// until the winner commits (typically microseconds). This timeout
+/// therefore only matters when some *other* process holds the write lock
+/// for a long time -- a long external transaction, or a hung/crashed
+/// process leaving a stale lock. A genuine deadlock is not affected by
+/// this value: `SQLite` returns `SQLITE_BUSY` immediately in that case
+/// rather than waiting. We pick a generous timeout so a slow but live
+/// lock-holder is tolerated, and only give up (panic) once a wait this
+/// long suggests the holder is never going to release.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub struct KVStore {
-    connection: Connection,
+/// A type that can be used as the value of a [`Store`].
+///
+/// This ties the owned value type (what [`Store::get`] returns) to its
+/// borrowed form (what [`Store::insert`] accepts). It is implemented for
+/// `String` (borrowed as `str`) and `Vec<u8>` (borrowed as `[u8]`).
+pub trait StoreValue: FromSql {
+    /// The borrowed form accepted by [`Store::insert`]: `str` for
+    /// `String`, `[u8]` for `Vec<u8>`.
+    type Ref: ToSql + ?Sized;
 }
 
-impl KVStore {
+impl StoreValue for String {
+    type Ref = str;
+}
+
+impl StoreValue for Vec<u8> {
+    type Ref = [u8];
+}
+
+/// A simple key-value store backed by `SQLite`, generic over its value
+/// type.
+///
+/// You will normally use one of the aliases [`KVStore`] (string values)
+/// or [`BlobStore`] (binary values) rather than naming `Store` directly.
+pub struct Store<V> {
+    connection: Connection,
+    _marker: PhantomData<fn() -> V>,
+}
+
+/// A key-value store mapping string keys to string values.
+pub type KVStore = Store<String>;
+
+/// A key-value store mapping string keys to binary (`Vec<u8>`) values.
+pub type BlobStore = Store<Vec<u8>>;
+
+impl<V: StoreValue> Store<V> {
     /// Creates a new in-memory key-value store.
     ///
     /// An in-memory key-value store is in practice worse than
@@ -140,19 +153,22 @@ impl KVStore {
     ///
     /// let kvstore = KVStore::new_in_memory().unwrap();
     /// ```
-    pub fn new_in_memory() -> rusqlite::Result<KVStore> {
+    pub fn new_in_memory() -> rusqlite::Result<Store<V>> {
         let connection = Connection::open_in_memory()?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
-        let kvstore = KVStore { connection };
-        kvstore.create_table()?;
-        Ok(kvstore)
+        let store = Store {
+            connection,
+            _marker: PhantomData,
+        };
+        store.create_table()?;
+        Ok(store)
     }
 
-    /// Creates a new `KVStore` using a file as the storage.
+    /// Creates a new store using a file as the storage.
     ///
     /// # Arguments
     ///
-    /// * `filename` - The path to the file used as the storage for the `KVStore`.
+    /// * `filename` - The path to the file used as the storage for the store.
     ///
     /// # Examples
     ///
@@ -161,16 +177,18 @@ impl KVStore {
     ///
     /// let kvstore = KVStore::new_from_file("mydata.db").unwrap();
     /// ```
-    pub fn new_from_file(filename: impl AsRef<Path>) -> rusqlite::Result<KVStore> {
+    pub fn new_from_file(filename: impl AsRef<Path>) -> rusqlite::Result<Store<V>> {
         let connection = Connection::open(filename)?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
-        let kvstore = KVStore { connection };
-        kvstore.create_table()?;
-        Ok(kvstore)
+        let store = Store {
+            connection,
+            _marker: PhantomData,
+        };
+        store.create_table()?;
+        Ok(store)
     }
 
-    /// Internal function which ensures `KVStore`
-    /// table is created
+    /// Internal function which ensures the store's table is created
     fn create_table(&self) -> rusqlite::Result<()> {
         self.connection.execute(
             &format!(
@@ -184,7 +202,7 @@ impl KVStore {
         Ok(())
     }
 
-    /// Inserts a key-value pair in the `KVStore`.
+    /// Inserts a key-value pair in the store.
     /// Overwrites any existing value.
     ///
     /// # Arguments
@@ -205,16 +223,16 @@ impl KVStore {
     ///
     /// kvstore.insert("key", "value");
     /// ```
-    pub fn insert(&self, key: &str, value: &str) {
+    pub fn insert(&self, key: &str, value: &V::Ref) {
         self.connection
             .execute(
                 &format!("REPLACE INTO {TABLE} ({KEY_COLUMN}, {VAL_COLUMN}) VALUES (?, ?)"),
-                [key, value],
+                rusqlite::params![key, value],
             )
             .expect("cute-sqlite-kv: insert failed");
     }
 
-    /// Checks if a particular key is contained in the `KVStore`.
+    /// Checks if a particular key is contained in the store.
     ///
     /// # Arguments
     ///
@@ -248,7 +266,7 @@ impl KVStore {
         exists != 0
     }
 
-    /// Retrieves the value for a given key from the `KVStore`.
+    /// Retrieves the value for a given key from the store.
     ///
     /// # Arguments
     ///
@@ -269,7 +287,7 @@ impl KVStore {
     ///
     /// assert_eq!(kvstore.get("key"), Some("value".to_string()));
     /// ```
-    pub fn get(&self, key: &str) -> Option<String> {
+    pub fn get(&self, key: &str) -> Option<V> {
         self.connection
             .query_row(
                 &format!("SELECT {VAL_COLUMN} FROM {TABLE} WHERE {KEY_COLUMN} = ?"),
@@ -280,7 +298,7 @@ impl KVStore {
             .expect("cute-sqlite-kv: get query failed")
     }
 
-    /// Removes a key-value pair from the `KVStore`,
+    /// Removes a key-value pair from the store,
     /// if present, and returns the old value if it existed.
     ///
     /// # Arguments
@@ -306,7 +324,7 @@ impl KVStore {
     ///
     /// assert_eq!(kvstore.remove("key"), None);
     /// ```
-    pub fn remove(&self, key: &str) -> Option<String> {
+    pub fn remove(&self, key: &str) -> Option<V> {
         self.connection
             .query_row(
                 &format!("DELETE FROM {TABLE} WHERE {KEY_COLUMN} = ? RETURNING {VAL_COLUMN}"),
@@ -317,7 +335,7 @@ impl KVStore {
             .expect("cute-sqlite-kv: remove failed")
     }
 
-    /// Clears the entire table in the `KVStore`.
+    /// Clears the entire table in the store.
     ///
     /// This method removes all key-value pairs from the table, effectively clearing the entire store.
     ///
@@ -346,9 +364,9 @@ impl KVStore {
             .expect("cute-sqlite-kv: clear failed");
     }
 
-    /// Checks if the `KVStore` is empty.
+    /// Checks if the store is empty.
     ///
-    /// Note: Since the `KVStore` can be used concurrently, the result of this method
+    /// Note: Since the store can be used concurrently, the result of this method
     /// can be out of date almost immediately.
     ///
     /// # Panics
@@ -378,9 +396,9 @@ impl KVStore {
         empty != 0
     }
 
-    /// Returns the number of key-value pairs in the `KVStore`.
+    /// Returns the number of key-value pairs in the store.
     ///
-    /// Note: Since the `KVStore` can be used concurrently, the result of this method
+    /// Note: Since the store can be used concurrently, the result of this method
     /// can be out of date almost immediately.
     ///
     /// # Panics
@@ -602,5 +620,31 @@ mod tests {
         kvstore.insert(key, value3);
         let result3 = kvstore.get(key);
         assert_eq!(result3, Some(value3.to_string()));
+    }
+
+    #[test]
+    fn test_blob_roundtrip() {
+        let store = BlobStore::new_in_memory().unwrap();
+        // Deliberately not valid UTF-8.
+        let value: &[u8] = &[0u8, 159, 146, 150, 255];
+        store.insert("key", value);
+        assert_eq!(store.get("key"), Some(value.to_vec()));
+        assert_eq!(store.remove("key"), Some(value.to_vec()));
+        assert_eq!(store.get("key"), None);
+    }
+
+    #[test]
+    fn test_blob_reopen() {
+        let temp_dir = tempdir().expect("Failed to create temp directory");
+        let filename = temp_dir.path().join("blobstore.db");
+        let value: &[u8] = &[10, 20, 0, 255, 128];
+        {
+            let store = BlobStore::new_from_file(&filename).unwrap();
+            store.insert("key", value);
+        }
+        {
+            let store = BlobStore::new_from_file(&filename).unwrap();
+            assert_eq!(store.get("key"), Some(value.to_vec()));
+        }
     }
 }
