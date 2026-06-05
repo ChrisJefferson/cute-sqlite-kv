@@ -11,7 +11,10 @@ keywords = ["sqlite", "key-value", "kv", "store", "persistent"]
 categories = ["database"]
 
 [dependencies]
-rusqlite = { version = "0.36.0" }
+# "bundled" compiles SQLite from source rather than linking a system
+# library, so the crate builds out of the box on every platform (notably
+# Windows, which otherwise fails to find sqlite3.lib). Requires a C compiler.
+rusqlite = { version = "0.36.0", features = ["bundled"] }
 
 
 [dev-dependencies]
