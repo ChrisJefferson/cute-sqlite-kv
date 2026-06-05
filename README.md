@@ -62,7 +62,7 @@ Opening a store (`new_from_file` / `new_in_memory`) returns a `Result`, because 
 
 Every *other* operation panics if the underlying SQLite call fails. Once the store is open, the only remaining failures are catastrophic (disk full, corruption, the file vanished) with no sensible recovery, so a loud panic is preferred over a silently dropped error. Lock contention between processes does **not** panic: a busy-timeout is set, so a writer waits for the lock rather than failing.
 
-The same file can be opened from multiple processes, and multiple times from the same process. `KVStore` is `Send` but not `Sync` (SQLite connections are not `Sync`), so to use it from several threads, open one `KVStore` per thread rather than sharing one behind an `Arc`.
+The same file can be opened from multiple processes, and multiple times from the same process. File-backed stores use SQLite's WAL mode so reads can proceed during a write; this creates two sidecar files (`<file>-wal`, `<file>-shm`) and is not supported on network filesystems such as NFS. `KVStore` is `Send` but not `Sync` (SQLite connections are not `Sync`), so to use it from several threads, open one `KVStore` per thread rather than sharing one behind an `Arc`.
 
 ## API Reference
 

@@ -13,7 +13,10 @@
 //! logic; only the value type differs. Keys are always `&str`.
 //!
 //! The store can be used from multiple processes, and also opened
-//! multiple times from the same process.
+//! multiple times from the same process. File-backed stores use WAL
+//! mode so reads can proceed during a write (see [`Store::new_from_file`]
+//! for the caveats, notably that WAL does not work over network
+//! filesystems).
 //!
 //! While `SQLite` can be very quick, this key-value store is not
 //! intended for high-performance situations, but when you need
@@ -80,7 +83,7 @@
 //! ```
 use std::marker::PhantomData;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::types::FromSql;
 use rusqlite::{Connection, OptionalExtension, ToSql};
@@ -103,6 +106,53 @@ const TABLE: &str = "KVStore_table";
 /// lock-holder is tolerated, and only give up (panic) once a wait this
 /// long suggests the holder is never going to release.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Puts a connection's database into WAL mode, robustly under concurrent
+/// cold opens.
+///
+/// Switching a fresh database to WAL needs a brief exclusive lock, and
+/// `SQLite` does *not* apply the connection's `busy_timeout` to a
+/// journal-mode change. So when many processes open the same brand-new
+/// file at once (e.g. lots of instances starting after a reboot), some of
+/// the WAL switches get `SQLITE_BUSY` and would otherwise fail the open.
+/// We retry within the same time budget as `busy_timeout`.
+///
+/// WAL is persistent in the database header, so the common warm-open case
+/// (already WAL) takes the fast path and never contends for the lock.
+fn enable_wal(connection: &Connection) -> rusqlite::Result<()> {
+    let current: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if current.eq_ignore_ascii_case("wal") {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + BUSY_TIMEOUT;
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0)) {
+            // The resulting mode may not be "wal" on a filesystem that does
+            // not support it (e.g. NFS); that is still a correct store, just
+            // without WAL, so we accept whatever we got.
+            Ok(_) => return Ok(()),
+            Err(e) if is_locked(&e) && Instant::now() < deadline => {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Whether an error is a `SQLITE_BUSY`/`SQLITE_LOCKED` lock-contention error.
+fn is_locked(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(e, _)
+            if matches!(
+                e.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
 
 /// A type that can be used as the value of a [`Store`].
 ///
@@ -166,6 +216,13 @@ impl<V: StoreValue> Store<V> {
 
     /// Creates a new store using a file as the storage.
     ///
+    /// The database is put into WAL (write-ahead logging) mode, so that
+    /// readers can proceed while another connection is writing. This is
+    /// persistent and creates two sidecar files next to the database
+    /// (`<file>-wal` and `<file>-shm`). WAL requires all accessing
+    /// processes to be on the same machine as the file; it is not
+    /// supported on network filesystems such as NFS.
+    ///
     /// # Arguments
     ///
     /// * `filename` - The path to the file used as the storage for the store.
@@ -180,6 +237,10 @@ impl<V: StoreValue> Store<V> {
     pub fn new_from_file(filename: impl AsRef<Path>) -> rusqlite::Result<Store<V>> {
         let connection = Connection::open(filename)?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
+        // Enable WAL so reads don't block on a concurrent write. This is a
+        // no-op for in-memory databases, which is why it lives here rather
+        // than in `new_in_memory`.
+        enable_wal(&connection)?;
         let store = Store {
             connection,
             _marker: PhantomData,
@@ -631,6 +692,21 @@ mod tests {
         assert_eq!(store.get("key"), Some(value.to_vec()));
         assert_eq!(store.remove("key"), Some(value.to_vec()));
         assert_eq!(store.get("key"), None);
+    }
+
+    #[test]
+    fn test_file_uses_wal() {
+        let temp_dir = tempdir().expect("Failed to create temp directory");
+        let filename = temp_dir.path().join("kvstore.db");
+        let _store = KVStore::new_from_file(&filename).unwrap();
+
+        // WAL mode is persistent in the database header, so a fresh
+        // connection reports it.
+        let raw = rusqlite::Connection::open(&filename).unwrap();
+        let mode: String = raw
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
     }
 
     #[test]
