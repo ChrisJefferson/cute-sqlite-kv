@@ -1,0 +1,5 @@
+# Build output
+/target
+
+# Cargo.lock is conventionally not committed for libraries
+Cargo.lock

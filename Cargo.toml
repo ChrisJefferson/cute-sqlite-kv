@@ -2,6 +2,13 @@
 name = "cute-sqlite-kv"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "A simple, multi-process, persistent key-value store backed by SQLite"
+license = "MPL-2.0"
+repository = "https://github.com/ChrisJefferson/cute-sqlite-kv"
+readme = "README.md"
+keywords = ["sqlite", "key-value", "kv", "store", "persistent"]
+categories = ["database"]
 
 [dependencies]
 rusqlite = { version = "0.36.0" }

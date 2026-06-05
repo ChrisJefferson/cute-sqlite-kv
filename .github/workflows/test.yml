@@ -1,4 +1,4 @@
-name: "demystify-rs"
+name: "Build and test"
 
 on:
   push:
@@ -21,18 +21,24 @@ jobs:
         os:
           - ubuntu-latest
           - macos-latest
-        include:
-          - os: ubuntu-latest
-            release_suffix: linux
-          - os: macos-latest
-            release_suffix: macos-intel
+          - windows-latest
 
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - run: rustup update ${{ matrix.rust_release }} && rustup default ${{ matrix.rust_release }}
 
-      - run: cargo build -vv --workspace
-      - run: cargo test --workspace
+      - run: cargo build --verbose
+      - run: cargo test --verbose
+
+  clippy:
+    name: "Clippy"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets -- -D warnings
